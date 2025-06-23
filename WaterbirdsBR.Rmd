@@ -1,0 +1,388 @@
+---
+title: "Population dynamics of water birds in BR"
+author: "Orlando Acevedo-Charry"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  bookdown::html_document2:
+    toc: yes
+    toc_float: true
+    number_sections: yes
+    fig_caption: true
+    df_print: paged
+    includes:
+      in_header: header.html
+subtitle: Gompertz Stochastic State-Space population models with Poisson error
+editor_options:
+  chunk_output_type: console
+---
+
+# Intro
+
+Bhal bhla bhla
+
+## Packages
+
+```{r packages}
+library(tidyverse)
+library(dclone); 
+library(mcmcplots)
+```
+
+# Data
+
+Update data organized
+
+```{r data}
+waterbirds <- read_csv("data/BR_waterbirds_monitoring.csv")
+```
+
+Let's convert in a long format to keep monitoring!!
+
+```{r}
+waterbird_long <- waterbirds |>
+  pivot_longer(cols = !c("Original_Date", "Year", "Month", "Day", "Site"), 
+               names_to = "Species", 
+               values_to = "Count", values_drop_na = TRUE) |>
+  mutate(Date = ymd(paste(Year, Month, Day, sep = "-")))
+
+write_csv(waterbird_long, "data/Monitoring_long_format.csv")
+```
+
+To this file, I added other columns to include the information in the previous format of monitoring regarding the survey (participants, activity, environmental conditions, hours of sampling) or the birds (e.g., photos, juveniles, flyovers).
+
+Now we can check that each species should have a single count for each time step in the time series in each site. We can select the maximum count per month per site in each species:
+```{r}
+waterbird_long <- waterbird_long |> 
+  mutate(year_month = floor_date(Date, "month")) |> 
+  dplyr::select(year_month, Site, Species, Count) |>
+  group_by(Species, Site, year_month) |>
+  summarise(Count = max(Count)) |>
+  as.data.frame()
+
+seq(min(waterbird_long$year_month), max(waterbird_long$year_month), by = "month")
+```
+
+The entire time series is 245 months, from March 2004 to July 2024.
+
+## Summary of the dataset
+
+How many species? How many months of survey per site have each species?
+```{r}
+waterbird_long |>
+  group_by(Species,Site,year_month) |>
+  count() |> 
+  group_by(Species,Site) |>
+  count() |> 
+  arrange(-n) |> 
+  pivot_wider(names_from = "Site", values_from = "n",values_fill = 0) |>
+  as.data.frame() 
+```
+
+This table is a first result to compare the two sites! Of the 106 species monitored in three sites, we focused on two sites with most data (PET and Embu) and species with counts in at least the 7% of surveys time-series (≥17), which is the mean of time steps per species x site combinations. Let's save this in `wtb_ts`, combine to the `waterbird_long` and remove those that do not have ≥17 time steps (identified by NA in the new column `n.time`.
+
+```{r}
+wtb_ts <- waterbird_long |>
+  group_by(Species,Site,year_month) |>
+  count() |> 
+  group_by(Species,Site) |>
+  count() |> 
+  filter(n >= 17) |> 
+  rename(n.time = n) |>
+  as.data.frame()
+
+wtb_tsSS <- waterbird_long |>
+  left_join(wtb_ts) |>
+  filter(!is.na(n.time)) |>
+  group_by(Site, Species) |>
+  arrange(year_month) |>
+  as.data.frame()
+```
+
+Now we have the observed time series for the species with better data. Let see the counts of the top-5 species with more data
+
+```{r}
+wtb_tsSS |>
+  filter(Species %in% c("Himantopus mexicanus melanurus",
+                        "Gallinula galeata",
+                        "Amazonetta brasiliensis",
+                        "Jacana jacana",
+                        "Tringa flavipes")) |>
+ggplot(aes(x = year_month, y = Count, color = Species)) +
+  facet_wrap(factor(Species,
+                    levels = c("Himantopus mexicanus melanurus",
+                        "Gallinula galeata",
+                        "Amazonetta brasiliensis",
+                        "Jacana jacana",
+                        "Tringa flavipes"))~Site, 
+             scales = "free_y", ncol = 2) +
+  geom_segment(aes(y = 0,
+                   yend = Count),
+               alpha = 0.5)+
+  geom_point(alpha = 0.6) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.text.x = element_text(face = "italic"),
+        strip.background = element_rect(colour = "black", fill = NA),
+        panel.border = element_rect(colour = "black", fill = NA))
+```
+
+## Prepare the time series for Data cloning
+
+```{r}
+prepare_dc_data_list <- function(df) {
+  
+  # Create full date sequence
+  full_dates <- seq(min(df$year_month), max(df$year_month), by = "month")
+  
+  # Expand grid of all combinations
+  full_grid <- expand.grid(year_month = full_dates,
+                           Site = unique(df$Site),
+                           Species = unique(df$Species),
+                           stringsAsFactors = FALSE)
+
+  # Merge and sort
+  df_full <- full_grid |>
+    left_join(df, by = c("year_month", "Site", "Species")) |>
+    arrange(Site, Species, year_month)
+  
+  # Extract year-month for grouping
+  df_full <- df_full |>
+    mutate(YearMonth = floor_date(year_month, "month"))
+  
+  # Summarize max count per month
+  monthly_max <- df_full |>
+    group_by(Site, Species, YearMonth) |>
+    summarise(MaxCount = max(Count, na.rm = TRUE), .groups = "drop") |>
+    mutate(MaxCount = ifelse(is.infinite(MaxCount), NA, MaxCount)) 
+
+  # Nest by Site and Species
+  nested <- df_full |>
+    group_by(Site, Species) |>
+    summarise(ts = list(Count), .groups = "drop") |>
+    mutate(name = paste(Site, Species, sep = "_"))
+
+  # Create named list of time series
+  Y1_list <- set_names(nested$ts, nested$name)
+
+  # Vector of time series lengths
+  Tvec <- map_int(Y1_list, length)
+
+  return(list(
+    Y1 = Y1_list,
+    Tvec = Tvec
+  ))
+}
+
+```
+
+```{r warning=FALSE}
+dc_data <- prepare_dc_data_list(wtb_tsSS)
+str(dc_data)
+```
+
+# Gompertz State Space model
+
+The model is 
+
+```{r}
+StochGSS.dc <- function(){
+  
+  # Priors on model parameters. Priors are DC1 in Lele et al (2007)
+  a1 ~ dnorm(0,1);   # constant, the population growth rate. 
+  c1 ~ dunif(-1,1);      # constant, the density dependence parameter. 
+  sig1 ~ dlnorm(-0.5,10); #variance parameter of stochastic  environment (process noise) in the system
+  stovar1 <- 1/pow(sig1,2)
+#  tau1 ~ dunif(0,1); # detection probability (scaling factor that adjust expected counts to imperfect detection or measurement error)
+#  obsvar1 <- 1/pow(tau1,2)
+  
+  for(k in 1:K){
+    # Simulate trajectory that depends on the previous
+    mean_X1[1,k] <- a1/(1-c1) # Expected value of the first realization of the process
+    # this is drawn from the stationary distribution of the process
+    # Equation 14 (main text) and  A.4 in Appendix of Dennis et al 2006
+    Varno1[k] <- pow(sig1,2)/(1-pow(c1,2)) #. Equation A.5 in Appendix of Dennis et al 2006
+    
+    # Updating the state: Stochastic process for all time steps
+    X1[1,k]~dnorm(mean_X1[1,k], 1/Varno1[k]); #first estimation of population
+    
+    #iteration of the GSS model in the data
+    for (t in 2:qp1) {
+      mean_X1[t,k] <- a1 + c1 * X1[(t - 1),k]
+      X1[t,k] ~ dnorm(mean_X1[t,k], stovar1) # Et is included here since a+cX(t-1) + Et ~ Normal(a+cX(t-1),sigma^2)
+    }
+    
+    # Updating the observations, from the counts under Poisson observation error
+      # incorporating detection probability directly into the Poisson mean
+    for (t in 1:qp1) {
+      Y1[t,k] ~ dpois(exp(X1[t,k]));
+    }
+  }
+}
+```
+
+I tried to include the detection probability as a scale factor adjusting the expected counts to imperfect detection $Y_t \sim \text{Poisson}(\tau \times \lambda_t)$, where $\lambda_t = e^{X_t}$, but the Data cloning estimability diagnostics cautioned the issue of including that additional parameter in the model (see [Lele et al. 2010](https://esajournals.onlinelibrary.wiley.com/doi/abs/10.1890/10-0099.1),)
+
+For this model, we will need some initial values of the parameters, and given that there are many `NA` a wrap to provide those initial guess values
+
+```{r two functions to guess initial parameters}
+guess.calc <- function(Yobs,Tvec){
+  
+  T.t <-Tvec-Tvec[1]; #  For calculations, time starts at zero.
+  q <- length(Yobs)-1;      #  Number of time series transitions, q.
+  qp1 <- q+1;              #  q+1 gets used a lot, too.
+  S.t <- T.t[2:qp1]-T.t[1:q];  #  Time intervals.
+  Ybar <- mean(Yobs);
+  Yvar <- sum((Yobs-Ybar)*(Yobs-Ybar))/q;
+  mu1 <- Ybar;
+  
+  # Kludge an initial value for theta based on mean of Y(t+s) given Y(t).
+  th1<- -mean(log(abs((Yobs[2:qp1]-mu1)/(Yobs[1:q]-mu1)))/S.t);            
+  bsq1<- 2*th1*Yvar/(1+2*th1);         # Moment estimate using stationary
+  tsq1<- bsq1;                         #   variance, with betasq=tausq.
+  
+  #three 0's 
+  three0s <- sum(c(th1,bsq1,tsq1))
+  if(three0s==0|is.na(three0s)){th1 <- 0.5;bsq1 <- 0.09; tsq1 <- 0.23;}
+  
+  
+  out1 <- c(th1,bsq1,tsq1);
+  if(sum(out1<1e-7)>=1){out1 <- c(0.5,0.09,0.23)}
+  out <- c(mu1,out1);
+  return(abs(out))
+  
+}
+
+guess.calc2.0<- function(TimeAndNs){
+  
+  newmat <- TimeAndNs 
+  isnas <- sum(is.na(TimeAndNs))
+  
+  if(isnas >= 1){
+    
+    isnaind <- which(is.na(TimeAndNs[,2]), arr.ind=TRUE)
+    newmat <- TimeAndNs[-isnaind,]
+    newmat[,1] <- newmat[,1] - newmat[1,1]
+    
+  }
+  
+  init.guess <- guess.calc(Yobs = log(newmat[,2]), Tvec=newmat[,1])
+  
+  mu1  <- init.guess[1]
+  th1  <- init.guess[2]
+  bsq1 <- init.guess[3]
+  sigsq1<- ((1-exp(-2*th1))*bsq1)/(2*th1)
+  
+  out <- c(mu=mu1, theta=th1, sigmasq = sigsq1)
+  return(out)
+}
+```
+
+And we have to bundle the data for Data cloning. Let's fit the first species in the taxa with higher data (_Himantpus mexicanus melanurus_ in Embu).
+
+```{r eval=FALSE}
+
+ts.4guess  <- dc_data$Y1[[16]] # this is Himantopus mexicanus in Embu
+tvec4guess  <- 1:245
+onets4guess <- cbind(tvec4guess, ts.4guess) # No NAS for KRV
+naive.guess <- guess.calc2.0(TimeAndNs = onets4guess)
+
+datalistGSS.dc <- list(K = 1,
+                       qp1 = as.numeric(dc_data$Tvec[16]),
+                       Y1 = dcdim(array(dc_data$Y1[[16]],dim = c(as.numeric(dc_data$Tvec[1]),1)))) 
+
+dcrun.GSS <- dc.fit(data = datalistGSS.dc,
+                    params = c("a1", "c1", "sig1"), #extract from the model
+                    model = StochGSS.dc, 
+                    n.clones = c(1,10,20),
+                    multiply = "K",
+                    unchanged = "qp1",
+                    n.chains = 3,
+                    n.adapt = 50000,
+                    n.update = 100,
+                    thin = 10,
+                    n.iter = 100000)
+
+saveRDS(dcrun.GSS, "data/test_dcfitGSS.rds")
+```
+
+
+```{r}
+dcrun.GSS <- readRDS("data/test_dcfitGSS.rds")
+
+summary(dcrun.GSS);
+dcdiag(dcrun.GSS) 
+plot(dcdiag(dcrun.GSS))
+pairs(dcrun.GSS)
+coef(dcrun.GSS)
+```
+
+And with these coefficients of the model, we can predict the dynamic with a Kalman filter for time series.
+
+```{r}
+Kalman.pred.fn <- function() {
+# Priors on model parameters: they are on the real line.
+  parms ~ dmnorm(MuPost,PrecPost)
+  a1 <- parms[1]   
+  c1 <- parms[2] 
+  sig1 <- parms[3]
+  stovar1 <- 1/pow(sig1,2)
+
+  # Likelihood
+  mean_X1[1] <- a1/(1-c1) # Expected value of the first realization of the process
+    # this is drawn from the stationary distribution of the process
+    # Equation 14 (main text) and  A.4 in Appendix of Dennis et al 2006
+    Varno1 <- pow(sig1,2)/(1-pow(c1,2)) #. Equation A.5 in Appendix of Dennis et al 2006
+    
+    # Updating the state: Stochastic process for all time steps
+    X1[1]~dnorm(mean_X1[1], 1/Varno1); #first estimation of population
+    N[1] <- exp(X1[1])
+    #iteration of the GSS model in the data
+    for (t in 2:qp1) {
+      mean_X1[t] <- a1 + c1 * X1[(t - 1)]
+      X1[t] ~ dnorm(mean_X1[t], stovar1) # Et is included here since a+cX(t-1) + Et ~ Normal(a+cX(t-1),sigma^2)
+      Y1[(t-1)] ~ dpois(exp(X1[t]))
+      N[t] <- exp(X1[t])
+    }
+}
+```
+
+```{r}
+data4kalman <- list(qp1 = as.numeric(dc_data$Tvec[16]),
+                    Y1 = array(dc_data$Y1[[16]],dim = c(as.numeric(dc_data$Tvec[16]))),
+                    MuPost = coef(dcrun.GSS),
+                    PrecPost = solve(vcov(dcrun.GSS))) 
+```
+
+And run the Bayesian inference using the MLE from Data cloning
+
+```{r}
+BH_DC_Pred = jags.fit(data=data4kalman, 
+                      params=c("N"), 
+                      model=Kalman.pred.fn)
+```
+
+```{r}
+summary(BH_DC_Pred)
+pred <- mcmcapply(BH_DC_Pred, quantile, c(0.25, 0.5, 0.75))
+plot(x = c(1:as.numeric(dc_data$Tvec[16])),
+     y = round(t(pred)[,2],0),
+     type = "b", ylim = c(0,max(t(pred))),
+     xlab = "Time", main = "White-backed Stilt - Embu",
+     ylab = "Population", col = "blue", pch = 24, cex = 0.75)
+polygon(c(1:as.numeric(dc_data$Tvec[16]),
+          rev(1:as.numeric(dc_data$Tvec[16]))), 
+        c((pred)[1,],
+          rev((pred)[3,])), 
+        col=scales::alpha("blue",0.25), border=NA)
+
+points(x = c(1:as.numeric(dc_data$Tvec[16])),
+     y = dc_data$Y1[[16]], col = "red", pch = 21, cex = 0.95,
+     type = "b", lty = 3)
+legend(40, (max(t(pred))*0.75), legend=c("Observed", "Estimated", "IQR (25%-75%)"),
+       col=c("red", "blue","blue"), lty=c(3,1,NA), 
+       cex=0.8, pch = c(21,24,NA),
+       fill = c(NA, NA, scales::alpha("blue",0.25)),
+       border = c(NA, NA, NA))
+```
